@@ -62,7 +62,7 @@
           "sha256": "95ad366d23fadf701d355bc45fb8b82ae2d700239471d35d41286ac3b08ff903"
         }
       ],
-      "status": "source pin and license inspected; build not verified"
+      "status": "historical source pin retained for provenance; not an active dependency of the native macOS Metal runtime"
     },
     {
       "name": "Vulkan-Loader",
@@ -77,7 +77,7 @@
           "sha256": "43c0a37e6a0fa7ff3c843b3ec5a4fac84b712558ddac103fbd4c1649662a9ece"
         }
       ],
-      "status": "source pin and license inspected; build not verified"
+      "status": "historical source pin retained for provenance; not an active dependency of the native macOS Metal runtime"
     },
     {
       "name": "MoltenVK",
@@ -92,8 +92,25 @@
           "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
         }
       ],
-      "status": "source pin and license inspected; build not verified",
-      "selection": "candidate host dependency, not an upstream-proven version; transitive ExternalRevisions audit pending"
+      "status": "historical source pin retained for provenance; not an active dependency of the native macOS Metal runtime",
+      "selection": "candidate host pin for prior/reference Vulkan-based paths; its transitive ExternalRevisions audit remains pending"
+    },
+    {
+      "name": "SPIRV-Cross",
+      "repository": "https://github.com/KhronosGroup/SPIRV-Cross",
+      "revision": "300681bbcb8365a8d1eacdacdbdd0249bbf1d6b1",
+      "source_url": "https://codeload.github.com/KhronosGroup/SPIRV-Cross/tar.gz/300681bbcb8365a8d1eacdacdbdd0249bbf1d6b1",
+      "sha256": "ca390d0cfb115504b97af1120c3a9479fb7b8f9e1a590fc80dca52ec1dd1c489",
+      "role": "native Metal runtime SPIR-V to Metal Shading Language compiler",
+      "license": "Apache-2.0",
+      "license_evidence": [
+        {
+          "path": "../native-metal/deps/SPIRV-Cross-300681bbcb8365a8d1eacdacdbdd0249bbf1d6b1/LICENSE",
+          "url": "https://github.com/KhronosGroup/SPIRV-Cross/blob/300681bbcb8365a8d1eacdacdbdd0249bbf1d6b1/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ],
+      "status": "archive checksum verified and root LICENSE inspected; gameplay acceptance not established"
     },
     {
       "name": "capstone",
@@ -170,6 +187,25 @@
         }
       ],
       "status": "resolved via API and git ls-remote; license inspected; translator source not cloned or built"
+    },
+    {
+      "name": "DroidSansFallback (optional local Chinese profile)",
+      "repository": "https://android.googlesource.com/platform/frameworks/base",
+      "revision": "4a5ee7b3096bba4b6a2eb3f01edc9a99681caeb7",
+      "license": "Apache-2.0",
+      "asset": {
+        "path": "data/fonts/DroidSansFallback.ttf",
+        "size": 3451900,
+        "sha256": "21b96a0377f067833a93af3082eb28d4ffab7a8cd46bfd513286f1d64b7b0949"
+      },
+      "license_evidence": [
+        {
+          "path": "data/fonts/NOTICE",
+          "url": "https://android.googlesource.com/platform/frameworks/base/+/4a5ee7b3096bba4b6a2eb3f01edc9a99681caeb7/data/fonts/NOTICE",
+          "sha256": "38751245389e1e23f73e6f5384b5cbe7fa972cc4410c5adc9c04b082a0b9561a"
+        }
+      ],
+      "status": "downloaded from fixed official revision; local types 1/2 replacement; glyph samples checked; retain NOTICE with local font profile; not a firmware font"
     }
   ],
   "tool_requirements": {
@@ -183,7 +219,7 @@
   },
   "unresolved": [
     "Ryubing shader/Common/Spv.Generator build and transitive NuGet packages not verified",
-    "MoltenVK transitive dependencies and actual Metal device/pipeline not verified",
+    "MoltenVK ExternalRevisions audit remains pending for the historical candidate pin; MoltenVK is not an active dependency of the native macOS Metal runtime",
     "No Astral Chain title/version/module/import/shader inventory yet",
     "No full runtime or simulator host build yet"
   ],

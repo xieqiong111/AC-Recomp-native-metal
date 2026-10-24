@@ -37,8 +37,50 @@
  constexpr uint64_t kAliasBase = 0x600000000ull;
 --- a/runtime/src/platform_mac.cpp
 +++ b/runtime/src/platform_mac.cpp
-@@ -122,6 +122,13 @@
+@@ -12,4 +12,6 @@
+ #include <cstdlib>
+ #include <mach/thread_switch.h>
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
+ #include <pthread/qos.h>
+ #include <sched.h>
+@@ -94,10 +96,30 @@
+ // ---- memory ---------------------------------------------------------------------------------------------------
+
+-// No MAP_FIXED_NOREPLACE on Darwin: ask for the address as a hint and give it back if the kernel chose another.
++// Reserve exactly without overwriting an existing mapping. mmap's non-fixed address is only a hint.
+ bool reserve(uint64_t addr, uint64_t size) {
+-    void* p = mmap(reinterpret_cast<void*>(addr), size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+-    if (p == MAP_FAILED) return false;
+-    if (uint64_t(p) != addr) {
+-        munmap(p, size);
++    mach_vm_address_t target = addr;
++    kern_return_t result = mach_vm_allocate(mach_task_self(), &target, size, VM_FLAGS_FIXED);
++    if (result != KERN_SUCCESS) {
++        nx::log("memory reserve: fixed Mach allocation failed at %llx (+%llx), status %d",
++                (unsigned long long)addr, (unsigned long long)size, int(result));
++        mach_vm_address_t region = addr;
++        mach_vm_size_t region_size = 0;
++        vm_region_basic_info_data_64_t info{};
++        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++        mach_port_t object = MACH_PORT_NULL;
++        if (mach_vm_region(mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64,
++                           reinterpret_cast<vm_region_info_t>(&info), &count, &object) == KERN_SUCCESS) {
++            nx::log("memory reserve: next mapping %llx (+%llx), protection %d/%d",
++                    (unsigned long long)region, (unsigned long long)region_size,
++                    int(info.protection), int(info.max_protection));
++            if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
++        }
++        return false;
++    }
++    result = mach_vm_protect(mach_task_self(), target, size, FALSE, VM_PROT_NONE);
++    if (result != KERN_SUCCESS) {
++        nx::log("memory reserve: Mach protection failed at %llx (+%llx), status %d",
++                (unsigned long long)addr, (unsigned long long)size, int(result));
++        mach_vm_deallocate(mach_task_self(), target, size);
+         return false;
      }
+@@ -123,5 +145,12 @@
      if (addr < lo) std::memset(reinterpret_cast<void*>(addr), 0, lo - addr);
      if (hi < addr + size) std::memset(reinterpret_cast<void*>(hi), 0, addr + size - hi);
 -    madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_FREE);

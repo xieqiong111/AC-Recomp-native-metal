@@ -31,6 +31,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,8 +42,9 @@ PIN = '010ed7a596a621c15d3a8dfa5795ca8c3668b066'
 WONDER_URL = 'https://github.com/BelmanteGu/SuperMarioWonderRecomp.git'
 RYUBING_URL = 'https://codeberg.org/Software_arch/Ryubing.git'
 RYUBING_PIN = 'a82350bb774f70fcbd41c9987bf67a3775409963'
-VULKAN_HEADERS_URL = 'https://github.com/KhronosGroup/Vulkan-Headers.git'
-VULKAN_HEADERS_PIN = 'e3b1eec08173d6b825cd3ac88c885a63b621504a'  # v1.4.357
+SPIRV_CROSS_PIN = '300681bbcb8365a8d1eacdacdbdd0249bbf1d6b1'
+SPIRV_CROSS_URL = 'https://codeload.github.com/KhronosGroup/SPIRV-Cross/tar.gz/' + SPIRV_CROSS_PIN
+SPIRV_CROSS_ARCHIVE_SHA256 = 'ca390d0cfb115504b97af1120c3a9479fb7b8f9e1a590fc80dca52ec1dd1c489'
 TITLE = '01007300020FA000'
 # The recompiler's Python dependencies, as pinned for the lift (CPU-REGEN-020 used exactly these).
 LIFT_PACKAGES = ('capstone==5.0.6', 'lz4==4.4.4', 'zstandard==0.24.0')
@@ -114,7 +116,7 @@ def check_format_profile(profile, sdk_image):
             'the format profile does not match this game version (fingerprint mismatch)')
 
 
-BREW_HINT = 'brew install cmake ninja pkg-config sdl3 opus molten-vk vulkan-headers spirv-tools zstd'
+BREW_HINT = 'brew install cmake ninja pkg-config sdl3 opus spirv-tools zstd'
 DOTNET_HINT = ('install the .NET 10 SDK: `brew install --cask dotnet-sdk`, or the macOS Arm64 installer from '
                'https://dotnet.microsoft.com/download/dotnet/10.0 (then open a new terminal)')
 
@@ -128,7 +130,7 @@ STAGES = (
     ('lift', 'recompile main and sdk to C++ with the pinned recompiler plus astral-sqshl.patch'),
     ('shaders', 'extract every shader from the RomFS and translate it to SPIR-V (.NET 10 SDK)'),
     ('runtime', 'prepare the pinned runtime and apply runtime/patches/series.macos'),
-    ('build', 'configure and build the astral executable (CMake, Ninja, SDL3, Vulkan headers, libopus)'),
+    ('build', 'configure and build the astral executable (CMake, Ninja, SDL3, Metal, SPIRV-Cross, libopus)'),
     ('fonts', 'install the six shared fonts (yours, or open-licensed replacements)'),
     ('data', 'lay out the data root (game files, SPIR-V, fonts, saves)'),
     ('app', 'write AC-Recomp.app and run-ac-recomp.sh'),
@@ -363,21 +365,6 @@ class Context:
                 return p
         return Path('/opt/homebrew')
 
-    def vulkan_include(self):
-        if self.a.vulkan_include:
-            return Path(self.a.vulkan_include)
-        for p in (self.brew_prefix() / 'include', self.deps / 'Vulkan-Headers/include'):
-            if (p / 'vulkan/vulkan.h').is_file():
-                return p
-        return self.deps / 'Vulkan-Headers/include'
-
-    def moltenvk(self):
-        if self.a.moltenvk:
-            return Path(self.a.moltenvk)
-        candidates = [self.brew_prefix() / 'lib/libMoltenVK.dylib', Path('/usr/local/lib/libMoltenVK.dylib')]
-        candidates += sorted(Path.home().glob('VulkanSDK/*/macOS/lib/libMoltenVK.dylib'), reverse=True)
-        return next((p for p in candidates if p.is_file()), None)
-
     def dotnet(self):
         exe = self.tool('dotnet')
         if not exe:
@@ -560,10 +547,6 @@ def stage_preflight(ctx):
     if not (prefix / 'lib/cmake/SDL3').is_dir():
         problems.append(f'SDL3 was not found under {prefix} (looked for lib/cmake/SDL3). {BREW_HINT}, '
                         'or pass --prefix <SDL3 install prefix>.')
-    if not ctx.moltenvk():
-        problems.append(f'MoltenVK (libMoltenVK.dylib) was not found. {BREW_HINT}, or pass --moltenvk <path>.')
-    if not (ctx.vulkan_include() / 'vulkan/vulkan.h').is_file():
-        notes.append('Vulkan headers not installed; the build will fetch the pinned Vulkan-Headers v1.4.357.')
     for name in ('cmake', 'ninja'):
         if not ctx.tool(name):
             notes.append(f'`{name}` not installed; it will be installed into the build venv with pip.')
@@ -1016,19 +999,43 @@ def stage_runtime(ctx):
             'source_sha256': hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()}
 
 
+def prepare_spirv_cross(ctx):
+    dest = ctx.deps / ('SPIRV-Cross-' + SPIRV_CROSS_PIN)
+    marker = dest / '.acr-archive-sha256'
+    if marker.is_file() and marker.read_text().strip() == SPIRV_CROSS_ARCHIVE_SHA256:
+        require((dest / 'spirv_msl.cpp').is_file(), 'the cached SPIRV-Cross source is incomplete')
+        return dest
+    ctx.mkdir(ctx.deps)
+    archive = fetch(ctx, SPIRV_CROSS_URL, SPIRV_CROSS_ARCHIVE_SHA256, ctx.deps / 'SPIRV-Cross.tar.gz')
+    if ctx.dry:
+        ctx.step('would extract the verified SPIRV-Cross archive for the native Metal shader compiler')
+        return dest
+    ctx.rmtree(dest)
+    prefix = 'SPIRV-Cross-' + SPIRV_CROSS_PIN
+    with tarfile.open(archive, 'r:gz') as src:
+        for member in src.getmembers():
+            relative = Path(member.name)
+            require(relative.parts and relative.parts[0] == prefix and '..' not in relative.parts,
+                    'unsafe path in the SPIRV-Cross archive')
+            target = ctx.deps / relative
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with src.extractfile(member) as inp, target.open('wb') as out:
+                    shutil.copyfileobj(inp, out)
+            else:
+                raise BuildError('unexpected link or special file in the SPIRV-Cross archive')
+    require((dest / 'spirv_msl.cpp').is_file(), 'the SPIRV-Cross archive lacks the MSL compiler')
+    marker.write_text(SPIRV_CROSS_ARCHIVE_SHA256 + '\n')
+    return dest
+
+
 def stage_build(ctx):
     cmake, ninja = ctx.tool('cmake'), ctx.tool('ninja')
     require(ctx.dry or (cmake and ninja), f'cmake/ninja missing; {BREW_HINT} or rerun --from-stage toolchain')
     cmake, ninja = cmake or 'cmake', ninja or 'ninja'
-    vk = ctx.vulkan_include()
-    if not (vk / 'vulkan/vulkan.h').is_file():
-        dest = ctx.deps / 'Vulkan-Headers'
-        ctx.rmtree(dest)
-        ctx.mkdir(dest)
-        ctx.run(['git', '-C', dest, 'init', '-q'])
-        ctx.run(['git', '-C', dest, 'fetch', '-q', '--depth', '1', VULKAN_HEADERS_URL, VULKAN_HEADERS_PIN])
-        ctx.run(['git', '-C', dest, 'checkout', '-q', '--detach', 'FETCH_HEAD'])
-        vk = dest / 'include'
+    cross = prepare_spirv_cross(ctx)
     prefix = ctx.brew_prefix()
     targets = ['astral']
     variant = {}
@@ -1037,7 +1044,8 @@ def stage_build(ctx):
         variant = write_variant_list(ctx)
     cmd = [cmake, '-S', ctx.runtime_src, '-B', ctx.build_dir, '-G', 'Ninja', '-DNX_GAME=astral',
            f'-DNX_GEN_DIR={ctx.gen}', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
-           f'-DCMAKE_MAKE_PROGRAM={ninja}', f'-DCMAKE_PREFIX_PATH={prefix}', f'-DNX_VULKAN_INCLUDE={vk}',
+           f'-DCMAKE_MAKE_PROGRAM={ninja}', f'-DCMAKE_PREFIX_PATH={prefix}',
+           f'-DNX_SPIRV_CROSS_SOURCE_DIR={cross}',
            '-DNX_HWOPUS=ON', f'-DNX_MAIN_VARIANT_LIST={ctx.variant_list if variant else ""}',
            f'-DNX_MAIN_VARIANT_NAME={VARIANT}', f'-DNX_SINGLE_FPS={single_fps(ctx)}']
     env = {'PKG_CONFIG_PATH': f'{prefix}/lib/pkgconfig:' + os.environ.get('PKG_CONFIG_PATH', '')}
@@ -1048,9 +1056,16 @@ def stage_build(ctx):
         if variant.get('compile'):
             require(any(str(ctx.gen_variant / 'main') in c['file'] for c in commands),
                     'the build does not include the 60 fps lift (runtime/patches/astral-fps-variant.patch)')
+        sources = [Path(c['file']) for c in commands]
+        require(any(p.name == 'nvn_metal.mm' for p in sources),
+                'the configured Astral target is missing its native Metal renderer')
+        require(not any(p.name.startswith('vk_') or p.name in ('nvn_vk.cpp', 'nvn_draw.cpp', 'nvn_present.cpp')
+                        for p in sources), 'the Astral target still includes Vulkan renderer sources')
         flags = ('-DNX_ASTRAL_STRICT=1', '-DNX_APPLE_HIGH_MEMORY=1')
+        if sys.platform == 'darwin' and int(platform.release().split('.')[0]) >= 27:
+            flags += ('-DNX_APPLE_MAC27_MEMORY=1',)
         require(all(all(f in c['command'] for f in flags) for c in commands),
-                'the configured build is missing NX_ASTRAL_STRICT/NX_APPLE_HIGH_MEMORY; the patch series did not apply')
+                'the configured build is missing required strict/Apple memory profile flags; the patch series did not apply')
     jobs = ctx.jobs()
     ctx.step(f'compiling with {jobs} jobs at low priority (can take an hour; --jobs N changes it; fewer jobs are '
              'used automatically under memory pressure; rerunning continues where it stopped)')
@@ -1190,13 +1205,13 @@ export NX_DATA_ROOT="${{NX_DATA_ROOT:-$default_root}}"
 if [ -z "${{NX_NVN_FORMAT_PROFILE:-}}" ] && [ -f "$NX_DATA_ROOT/astral.profile" ]; then
   export NX_NVN_FORMAT_PROFILE="$NX_DATA_ROOT/astral.profile"
 fi
-export SDL_VULKAN_LIBRARY="${{SDL_VULKAN_LIBRARY:-$here/../Frameworks/libMoltenVK.dylib}}"
-{native}# Frame rate (docs/ASTRAL_60FPS.md): NX_FPS, else settings.ini's fps (the launcher's Frame rate setting). 60 runs
+{native}# Frame rate (docs/ASTRAL_60FPS.md): NX_FPS, else settings.ini, else 60. 60 runs
 # astral-60fps when this build has it; the launcher switches binaries itself when the setting changes there.
 fps="${{NX_FPS:-}}"
 if [ -z "$fps" ] && [ -f "$NX_DATA_ROOT/settings.ini" ]; then
   fps="$(sed -n 's/^[[:space:]]*fps[[:space:]]*=[[:space:]]*\\([0-9]*\\).*/\\1/p' "$NX_DATA_ROOT/settings.ini" | tail -n 1)"
 fi
+fps="${{fps:-60}}"
 bin=astral
 if [ "$fps" = 60 ] && [ -x "$here/astral-{variant}" ]; then
   bin=astral-{variant}
@@ -1258,11 +1273,9 @@ def app_icon(ctx, contents):
 
 def stage_app(ctx):
     exe = ctx.build_dir / 'astral'
-    mvk = ctx.moltenvk()
     require(ctx.dry or exe.is_file(), 'no astral executable; rerun --from-stage build')
-    require(ctx.dry or mvk, 'MoltenVK not found; pass --moltenvk <path to libMoltenVK.dylib>')
     contents = ctx.app / 'Contents'
-    # --render-res: the launcher labels window sizes relative to it ("2560x1440 (Native)").
+    # --render-res records the internal game size; window sizes are logical points.
     native = (f'export NX_NATIVE_RES="${{NX_NATIVE_RES:-{ctx.a.render_res}}}"\n'
               if getattr(ctx.a, 'render_res', None) else '')
     ctx.rmtree(ctx.app)
@@ -1272,7 +1285,6 @@ def stage_app(ctx):
         exe60 = ctx.build_dir / f'astral-{VARIANT}'
         require(ctx.dry or exe60.is_file(), f'no astral-{VARIANT} executable; rerun --from-stage build')
         ctx.copy(exe60, contents / f'MacOS/astral-{VARIANT}')
-    ctx.copy(mvk or 'libMoltenVK.dylib', contents / 'Frameworks/libMoltenVK.dylib')
     assets = ctx.root / 'assets/launcher'
     for f in sorted(assets.iterdir()) if assets.is_dir() else ():
         ctx.copy(f, contents / 'Resources/assets/launcher' / f.name)
@@ -1288,8 +1300,6 @@ def stage_app(ctx):
     ctx.write(ctx.out / 'run-ac-recomp.sh', '#!/bin/sh\nexec "$(dirname "$0")/AC-Recomp.app/Contents/MacOS/AC-Recomp" '
               '"$@"\n', mode=0o755)
     if not ctx.dry and shutil.which('codesign'):
-        ctx.run(['codesign', '--force', '--sign', '-', contents / 'Frameworks/libMoltenVK.dylib'], check=False,
-                capture=True)
         for exe_name in ['astral'] + ([f'astral-{VARIANT}'] if variant_built(ctx) else []):
             ctx.run(['codesign', '--force', '--sign', '-', contents / 'MacOS' / exe_name], check=False, capture=True)
     ctx.step(f'done: open {ctx.app} (or run {ctx.out / "run-ac-recomp.sh"})')
@@ -1337,6 +1347,8 @@ def stage_inputs(ctx):
         lift += f':render-res={ctx.a.render_res}:mem={ctx.a.graphics_memory_mib or "auto"}:' + \
             sha256(ctx.root / 'tools/astral_render_res.py')
     return {'upstream': PIN, 'lift': lift,
+            'build': 'native-metal-v1:' + SPIRV_CROSS_PIN + ':' + SPIRV_CROSS_ARCHIVE_SHA256,
+            'app': sha256(ctx.root / 'tools/acr_build.py'),
             'control': digest([patches / 'astral-control-import.patch']),
             'runtime': PIN + ':' + digest([series] + [patches / n for n in names])}
 
@@ -1394,14 +1406,12 @@ def parse(argv=None):
     p.add_argument('--ryubing', help='local clone or URL of Ryubing (default: Codeberg)')
     p.add_argument('--lift-python', help='Python used for the recompiler venv (default: this one)')
     p.add_argument('--prefix', type=Path, help='install prefix of SDL3/opus (default: Homebrew)')
-    p.add_argument('--vulkan-include', type=Path, help='Vulkan headers include directory')
-    p.add_argument('--moltenvk', type=Path, help='path to libMoltenVK.dylib')
     p.add_argument('--dotnet', type=Path, help='the dotnet executable of a .NET 10 SDK')
     p.add_argument('--cmake', type=Path)
     p.add_argument('--ninja', type=Path)
     p.add_argument('--jobs', type=int, help='parallel compile jobs (default: by CPU count and memory)')
-    p.add_argument('--render-res', metavar='WxH',
-                   help='docked internal resolution, e.g. 2560x1440 (stock 1600x900; patches main before lifting, '
+    p.add_argument('--render-res', metavar='WxH', default='1920x1080',
+                   help='docked internal resolution, e.g. 2560x1440 (default 1920x1080; patches main before lifting, '
                         'see docs/ASTRAL_RENDER_RES.md)')
     p.add_argument('--graphics-memory-mib', type=int, metavar='MIB',
                    help='with --render-res: the game\'s graphics memory budget (default: scaled; stock 310)')

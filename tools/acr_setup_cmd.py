@@ -25,10 +25,9 @@ import sys
 KIT = Path(__file__).resolve().parents[1]
 MIN_PYTHON = (3, 11)
 BREW_PREFIXES = ('/opt/homebrew', '/usr/local')
-# Homebrew formulae tools/acr_build.py's preflight requires (cmake and ninja fall back to the build venv, and the
-# Vulkan headers to a pinned checkout, but installing them is faster and is what the docs recommend).
-FORMULAE = ('cmake', 'ninja', 'pkg-config', 'sdl3', 'opus', 'molten-vk', 'vulkan-headers', 'spirv-tools', 'zstd')
-OPTIONAL_FORMULAE = {'cmake', 'ninja', 'vulkan-headers'}
+# Homebrew formulae used by the native Metal build; cmake and ninja can fall back to the build venv.
+FORMULAE = ('cmake', 'ninja', 'pkg-config', 'sdl3', 'opus', 'spirv-tools', 'zstd')
+OPTIONAL_FORMULAE = {'cmake', 'ninja'}
 BREW_INSTALL = ('/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"')
 DOTNET_DIRS = ('/usr/local/share/dotnet', '~/.dotnet')
 # Microsoft's installer into the user's home: no administrator password (the Homebrew cask needs one).

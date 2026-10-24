@@ -24,7 +24,7 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 6518589..7a35db2 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -7,6 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+@@ -7,6 +7,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
  # The game this build is for: games/<NX_GAME>/ holds what only that game needs (game.cpp: nx/game.h), the shared
  # runtime is the rest. One build directory per game.
  set(NX_GAME "hades" CACHE STRING "Game to build (a folder under games/)")
@@ -36,12 +36,15 @@ index 6518589..7a35db2 100644
 +            message(FATAL_ERROR "Astral bootstrap is native macOS only; simulator integration pending")
 +        endif()
 +        add_compile_definitions(NX_APPLE_HIGH_MEMORY=1)
++        if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_SYSTEM_VERSION VERSION_GREATER_EQUAL "27")
++            add_compile_definitions(NX_APPLE_MAC27_MEMORY=1)
++        endif()
 +    endif()
 +endif()
  set(NX_GAME_DIR "${CMAKE_SOURCE_DIR}/games/${NX_GAME}")
  if(NOT EXISTS "${NX_GAME_DIR}/game.cpp")
      message(FATAL_ERROR "games/${NX_GAME}/game.cpp not found")
-@@ -62,6 +72,13 @@ endif()
+@@ -62,6 +75,13 @@ endif()
 
  # Without the generated code (a checkout with no game data) only the tests above are built.
  file(GLOB NX_GEN_PROBE "${NX_GEN_DIR}/main/*.cpp")

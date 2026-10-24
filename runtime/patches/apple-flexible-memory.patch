@@ -1,0 +1,151 @@
+diff --git a/runtime/include/nx/runtime.h b/runtime/include/nx/runtime.h
+--- a/runtime/include/nx/runtime.h
++++ b/runtime/include/nx/runtime.h
+@@ -63,6 +63,21 @@
+ // Kept below 0x70_0000_0000: Android (39-bit address space) maps the process's own libraries and heap up there.
+ constexpr uint64_t kKernelBase = 0x6A00000000ull;
+ constexpr uint64_t kThunkBase = 0x6F00000000ull;
++#endif
++#if defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY) && defined(NX_APPLE_MAC27_MEMORY)
++// True only when the complete range belongs to one reserved guest region. Dynamic Mac layouts have holes and
++// deliberately leave the HLE thunk range unmapped; guest pointers remain direct host addresses.
++inline bool guest_region_contains(uint64_t address, uint64_t length) {
++    if (!length) return false;
++    const auto contains = [address, length](uint64_t base, uint64_t size) {
++        if (!base || address < base) return false;
++        const uint64_t offset = address - base;
++        return offset <= size && length <= size - offset;
++    };
++    return contains(kModuleBase, 0x20000000ull) || contains(kHeapBase, kHeapMax) ||
++           contains(kAliasBase, kAliasSize) || contains(kStackBase, kStackSize) ||
++           contains(kKernelBase, kKernelSize);
++}
+ #endif
+ // kKernelBase: TLS pages, main thread stack (memory we hand out). kThunkBase: HLE function addresses (never mapped).
+ 
+diff --git a/runtime/src/memory.cpp b/runtime/src/memory.cpp
+--- a/runtime/src/memory.cpp
++++ b/runtime/src/memory.cpp
+@@ -14,6 +14,7 @@
+ #include <mach/mach.h>
+ #include <mach/mach_vm.h>
+ #include <unistd.h>
++#include <utility>
+ #endif
+ 
+ namespace nx {
+@@ -39,13 +40,21 @@
+ void reserve_dynamic_regions() {
+     struct Gap { uint64_t begin, end; };
+     const uint64_t limit = kAddressSpaceBase + kAddressSpaceSize;
+-    const uint64_t first = kThunkBase + kThunkSize;
+     const uint64_t page = uint64_t(getpagesize());
+     const std::array<uint64_t, 4> sizes{kHeapMax, kAliasSize, kStackSize, kKernelSize};
+-    // Preserve alias < stack and kernel highest: existing pointer classification relies on this.
+-    const unsigned orders[3][4] = {{0, 1, 2, 3}, {1, 0, 2, 3}, {1, 2, 0, 3}};
++    // Prefer the established alias-before-stack layouts, then consider every remaining order.
++    // QueryMemory derives the free intervals from their selected addresses below.
++    const unsigned orders[24][4] = {
++        {0, 1, 2, 3}, {0, 1, 3, 2}, {0, 3, 1, 2}, {1, 0, 2, 3},
++        {1, 0, 3, 2}, {1, 2, 0, 3}, {1, 2, 3, 0}, {1, 3, 0, 2},
++        {1, 3, 2, 0}, {3, 0, 1, 2}, {3, 1, 0, 2}, {3, 1, 2, 0},
++        {0, 2, 1, 3}, {0, 2, 3, 1}, {0, 3, 2, 1}, {2, 0, 1, 3},
++        {2, 0, 3, 1}, {2, 1, 0, 3}, {2, 1, 3, 0}, {2, 3, 0, 1},
++        {2, 3, 1, 0}, {3, 0, 2, 1}, {3, 2, 0, 1}, {3, 2, 1, 0},
++    };
+     std::vector<Gap> gaps;
+-    // Observe the full guest range for failure diagnostics; placement still starts after the fixed thunks.
++    // Modules and thunks were reserved before this scan. Observe and search the whole guest range so usable lower
++    // gaps are candidates too; the fixed reservations remain occupied and cannot be selected.
+     uint64_t cursor = kAddressSpaceBase;
+     while (cursor < limit) {
+         mach_vm_address_t address = cursor;
+@@ -79,7 +88,7 @@
+             }
+             return false;
+         };
+-        if (place(0, first)) { found = true; break; }
++        if (place(0, kAddressSpaceBase)) { found = true; break; }
+     }
+     if (!found) {
+         uint64_t total_free = 0, max_gap = 0;
+@@ -134,10 +143,21 @@
+     // Only the alias and stack regions are free for the guest to pick addresses in (nn::os maps shared memory,
+     // transfer memory and thread stacks at random free addresses); everything else is reported inaccessible.
+     uint64_t end = kAddressSpaceBase + kAddressSpaceSize;
++#if defined(__APPLE__) && defined(NX_APPLE_MAC27_MEMORY)
++    std::array<std::pair<uint64_t, uint64_t>, 2> free_regions{{{kAliasBase, kAliasSize}, {kStackBase, kStackSize}}};
++    std::sort(free_regions.begin(), free_regions.end());
++    uint64_t cursor = kAddressSpaceBase;
++    for (const auto& region : free_regions) {
++        if (cursor < region.first) vm_set(cursor, region.first - cursor, kMemInaccessible, 0);
++        cursor = region.first + region.second;
++    }
++    if (cursor < end) vm_set(cursor, end - cursor, kMemInaccessible, 0);
++#else
+     vm_set(kAddressSpaceBase, kAliasBase - kAddressSpaceBase, kMemInaccessible, 0);
+     if (kAliasBase + kAliasSize < kStackBase)  // Android: the alias sits below the modules (runtime.h)
+         vm_set(kAliasBase + kAliasSize, kStackBase - (kAliasBase + kAliasSize), kMemInaccessible, 0);
+     vm_set(kStackBase + kStackSize, end - (kStackBase + kStackSize), kMemInaccessible, 0);
++#endif
+ }
+ 
+ bool commit(uint64_t addr, uint64_t size) {
+diff --git a/runtime/src/hle_audio.cpp b/runtime/src/hle_audio.cpp
+--- a/runtime/src/hle_audio.cpp
++++ b/runtime/src/hle_audio.cpp
+@@ -334,14 +334,21 @@
+ // pointer hops of the handle.
+ uint64_t find_renderer(uint64_t handle) {
+     uint64_t vptr = sdk_base() + kRendererVtable + 0x10;
+-    auto valid = [](uint64_t p) { return p >= kModuleBase && p < kKernelBase + kKernelSize && (p & 7) == 0; };
++#if defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY) && defined(NX_APPLE_MAC27_MEMORY)
++    auto valid = [](uint64_t p, uint64_t length) { return (p & 7) == 0 && guest_region_contains(p, length); };
++    if (!valid(handle, 0x40)) return 0;
++#else
++    auto valid = [](uint64_t p, uint64_t) {
++        return p >= kModuleBase && p < kKernelBase + kKernelSize && (p & 7) == 0;
++    };
++#endif
+     for (uint64_t a = 0; a < 0x40; a += 8) {
+         uint64_t p = ld<uint64_t>(handle + a);
+-        if (!valid(p)) continue;
++        if (!valid(p, 0x40)) continue;
+         if (ld<uint64_t>(p) == vptr) return p + 0x10;
+         for (uint64_t b = 0; b < 0x40; b += 8) {
+             uint64_t q = ld<uint64_t>(p + b);
+-            if (valid(q) && ld<uint64_t>(q) == vptr) return q + 0x10;
++            if (valid(q, sizeof(uint64_t)) && ld<uint64_t>(q) == vptr) return q + 0x10;
+         }
+     }
+     return 0;
+diff --git a/runtime/src/kernel_watch.cpp b/runtime/src/kernel_watch.cpp
+--- a/runtime/src/kernel_watch.cpp
++++ b/runtime/src/kernel_watch.cpp
+@@ -140,7 +140,11 @@
+         if (!t || !t->started || t->exited) continue;
+         std::string chain = describe(t->ctx.x[30]);
+         uint64_t fp = t->ctx.x[29];
++#if defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY) && defined(NX_APPLE_MAC27_MEMORY)
++        for (int k = 0; k < 12 && fp && (fp & 7) == 0 && guest_region_contains(fp, 16); k++) {
++#else
+         for (int k = 0; k < 12 && fp && (fp & 7) == 0 && fp >= kModuleBase; k++) {
++#endif
+             uint64_t lr = ld<uint64_t>(fp + 8);
+             if (!lr) break;
+             chain += " < " + describe(lr);
+diff --git a/runtime/src/nvn/nvn_objects.cpp b/runtime/src/nvn/nvn_objects.cpp
+--- a/runtime/src/nvn/nvn_objects.cpp
++++ b/runtime/src/nvn/nvn_objects.cpp
+@@ -310,7 +310,11 @@
+     // Wonder), so it only says "packaged", and the block height is the fit that matches every BNTX texture in the
+     // game: the smallest power of two >= rows * 3 / 32, at most 16 GOBs.
+     uint64_t layout = driver(c, "nvnTextureBuilderGetPackagedTextureLayout", {builder});
++#if defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY) && defined(NX_APPLE_MAC27_MEMORY)
++    if (guest_region_contains(layout, sizeof(uint64_t))) layout = ld<uint64_t>(layout);
++#else
+     if (layout >= kModuleBase && layout < kKernelBase + kKernelSize) layout = ld<uint64_t>(layout);
++#endif
+     if (layout) {
+         uint32_t bw = 1, bh = 1, bytes = 0;
+         format_block(t.format, bw, bh, bytes);

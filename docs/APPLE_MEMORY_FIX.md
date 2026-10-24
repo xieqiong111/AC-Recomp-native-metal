@@ -161,3 +161,83 @@ preparation, consistent profile flags across all native generated/runtime target
 and full linked-runtime reservation/boot tests. Neither gameplay, resident 6 GiB
 heap capacity, Metal/Vulkan sharing, mobile signing for physical devices nor
 performance is established by this unit.
+
+## Local Darwin 27 integration (2026-10-21)
+
+The final linked native build on an M5 MacBook Air with macOS 27.0.1 failed to
+reserve the high-v1 alias. A non-fixed mmap request for
+`0x7300000000 + 0x400000000` returned `0x737c800000` and was correctly rejected.
+A subsequent exact Mach allocation failed with status 3; its region query found
+an existing RW mapping at `0x76ee000000 + 0x400000`, inside the requested alias.
+Another fresh process failed earlier at the high heap: a `PROT_NONE` mapping at
+`0x71b4000000 + 0x300800000` overlapped it. Moving only the alias therefore does
+not address all observed high-profile conflicts.
+This is a virtual address conflict, not evidence of 16 GiB of physical RAM use.
+
+The local patches use `mach_vm_allocate` with `VM_FLAGS_FIXED` and without
+`VM_FLAGS_OVERWRITE`, followed by current protection `VM_PROT_NONE`. Conflicts
+remain fatal; no existing mapping is replaced, and no alternate address is
+accepted. The maximum protection remains available for later RW commits.
+
+An initial local experiment used a Darwin 27 compile definition to select the
+complete pre-existing low Apple layout in both `cpu.h` and `runtime.h`: modules
+at 12 GiB, heap at 16 GiB, alias at 24 GiB, stack at 40 GiB, kernel at 44 GiB and
+thunk identifiers at 56 GiB. Every generated translation unit was rebuilt.
+That failed experiment is superseded by the explicit dynamic profile below.
+
+This local integration must be validated in the final native process. Neither
+successful compilation nor the address choice alone establishes gameplay,
+save/reload correctness, performance, or compatibility with other hosts.
+
+The complete low-layout attempt also failed in the real final process: the
+module reservation `0x300000000 + 0x20000000` returned Mach status 3. Its next
+mapping was `0x2e6000000 + 0xcda000000`, current/maximum protection `1/1`, covering
+the requested module range. The local Darwin 27 layout is therefore a failed
+experiment, not a validated compatibility fix. Both fixed-layout families are
+blocked on the observed host mappings; gameplay, input, audio and save/reload
+were not reached. The original source and game inputs remain recoverable.
+
+### Mapping ownership and dynamic Darwin 27 profile
+
+Actual final-process `vmmap` plus recursive Mach metadata identified the low
+module collision as the dyld shared cache's combined `__LINKEDIT` mapping,
+`[0x2e6980000, 0x34a394000)`. The larger read-only entry is a shared submap,
+not a single 51 GiB resident allocation. At high addresses the process has
+`VM_MEMORY_MALLOC_SMALL` regions (tag 2), with about 24 GiB of surrounding
+inaccessible reserved space. Both were already present in a diagnostic dylib's
+constructor before `main()`, ruling out simply moving reservation before SDL.
+The diagnostic injection only observed failures; it did not replace mappings.
+Raw address metadata and vmmap evidence remain under the ignored local build.
+
+The current `NX_APPLE_MAC27_MEMORY` profile preserves compile-time `NX_BASE`
+at 448 GiB for every generated and runtime translation unit. Only heap, alias,
+stack and kernel bases are chosen once in `memory_init()`. Their full sizes
+remain 6/16/4/4 GiB. The fixed 512 MiB module range and adjacent 1 MiB thunk
+range are reserved first. A top-level Mach scan conservatively excludes entire
+submaps and guards, then searches remaining gaps below the 39-bit limit.
+All 24 region orders are considered, preferring the 12 alias-before-stack orders.
+QueryMemory sorts the alias and stack ranges by address and marks their complement
+inaccessible, so a high alias region no longer requires enough space for a stack
+above it. Individual region checks preserve pointer classification independently
+of the selected order. Layouts with no contiguous 16 GiB gap still fail explicitly.
+Candidates are page-aligned; only exact non-overwriting reservations establish
+ownership. If a candidate changes after scanning, only this attempt's successful
+reservations are released and boot fails explicitly. No allocator protection is
+disabled, no region size reduced, and guest pointers remain direct host pointers.
+Kernel allocation and VI token initialization now follow layout selection.
+The native build verifies the profile definition in every compile command.
+
+The rebuilt final native process passed reservation, loaded main/sdk with zero
+unresolved strong links, entered `nn::init::Start`, initialized Vulkan/MoltenVK
+and the 48 kHz stereo audio device, and visibly rendered the animated 3D start
+screen with the ZL+ZR prompt. After normal window-close (exit 0), a fresh process
+through the standard launcher / Play / Default profile also reached that screen.
+The two observed alias bases were `0x71a0100000` and `0x783a000000`; both retained
+the full region sizes. Render logs around the start screen reported about 30 fps.
+Neither run used diagnostic injection, headless mode or scripted game inputs.
+The first run remained at the start screen for over 20 minutes before closing;
+this is start-screen evidence, not a full-game stability or performance result.
+The keyboard launcher accepted Enter, but entering beyond the in-game ZL+ZR
+prompt, audible output, combat, save/load and physical controllers remain pending.
+The computer-use tool cannot press two non-modifier letter keys simultaneously;
+the user can press the default Z+C mapping directly. No tests were run.

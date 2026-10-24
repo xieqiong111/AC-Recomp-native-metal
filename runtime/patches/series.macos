@@ -36,3 +36,6 @@ astral-save-profiles.patch
 astral-controls-ui.patch
 astral-fps-variant.patch
 astral-texel-coalesce.patch
+apple-dynamic-memory.patch
+astral-native-metal.patch
+apple-flexible-memory.patch

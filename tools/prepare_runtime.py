@@ -408,6 +408,9 @@ def execute(a):
                 validate_ios_commands(commands, gen)
             if sys.platform == 'darwin':
                 require(all('-DNX_APPLE_HIGH_MEMORY=1' in x['command'] for x in commands), 'mixed Apple profiles')
+                if not ios and int(os.uname().release.split('.')[0]) >= 27:
+                    require(all('-DNX_APPLE_MAC27_MEMORY=1' in x['command'] for x in commands),
+                            'mixed macOS 27 memory profiles')
         if a.build:
             run_logged([a.cmake, '--build', out / 'build', '--parallel', jobs(a.jobs), '--target', 'astral'], out / 'build.log')
             require((out / ('build/astral.app/astral' if ios else 'build/astral')).is_file(), 'no executable produced')

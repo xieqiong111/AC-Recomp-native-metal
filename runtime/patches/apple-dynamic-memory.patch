@@ -1,0 +1,164 @@
+--- a/runtime/include/nx/runtime.h
++++ b/runtime/include/nx/runtime.h
+@@ -26,7 +26,12 @@
+ constexpr uint64_t kStackSize = 0x100000000ull;
+ constexpr uint64_t kKernelSize = 0x100000000ull;
+ constexpr uint64_t kThunkSize = 0x100000ull;
+-#if defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY)
++#if defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY) && defined(NX_APPLE_MAC27_MEMORY)
++// Modules remain at their compiled address; other regions are selected once before guest boot.
++extern uint64_t kHeapBase, kAliasBase, kStackBase, kKernelBase;
++constexpr uint64_t kAliasSize = 0x400000000ull;
++constexpr uint64_t kThunkBase = kModuleBase + 0x20000000ull;
++#elif defined(__APPLE__) && defined(NX_APPLE_HIGH_MEMORY)
+ // apple-high-v1: no fallback or relocation; all pointers remain direct host pointers.
+ constexpr uint64_t kHeapBase = 0x7100000000ull;
+ constexpr uint64_t kAliasBase = 0x7300000000ull;
+--- a/runtime/src/memory.cpp
++++ b/runtime/src/memory.cpp
+@@ -7,13 +7,27 @@
+ 
+ #include "platform.h"
+ 
++#if defined(__APPLE__) && defined(NX_APPLE_MAC27_MEMORY)
++#include <algorithm>
++#include <array>
++#include <functional>
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
++#include <unistd.h>
++#endif
++
+ namespace nx {
++
++#if defined(__APPLE__) && defined(NX_APPLE_MAC27_MEMORY)
++uint64_t kHeapBase = 0, kAliasBase = 0, kStackBase = 0, kKernelBase = 0;
++#endif
+ 
+ namespace {
+ 
+ std::mutex g_vm_lock;
+ std::map<uint64_t, VmInfo> g_vm;  // start -> block (non-overlapping; gaps are free)
+-uint64_t g_kernel_next = kKernelBase;
++// Assigned after selecting the runtime layout, before kernel_init.
++uint64_t g_kernel_next = 0;
+ 
+ void reserve(uint64_t addr, uint64_t size, const char* what) {
+     if (!plat::reserve(addr, size))
+@@ -21,10 +35,90 @@
+               (unsigned long long)size);
+ }
+ 
++#if defined(__APPLE__) && defined(NX_APPLE_MAC27_MEMORY)
++void reserve_dynamic_regions() {
++    struct Gap { uint64_t begin, end; };
++    const uint64_t limit = kAddressSpaceBase + kAddressSpaceSize;
++    const uint64_t first = kThunkBase + kThunkSize;
++    const uint64_t page = uint64_t(getpagesize());
++    const std::array<uint64_t, 4> sizes{kHeapMax, kAliasSize, kStackSize, kKernelSize};
++    // Preserve alias < stack and kernel highest: existing pointer classification relies on this.
++    const unsigned orders[3][4] = {{0, 1, 2, 3}, {1, 0, 2, 3}, {1, 2, 0, 3}};
++    std::vector<Gap> gaps;
++    // Observe the full guest range for failure diagnostics; placement still starts after the fixed thunks.
++    uint64_t cursor = kAddressSpaceBase;
++    while (cursor < limit) {
++        mach_vm_address_t address = cursor;
++        mach_vm_size_t size = 0;
++        vm_region_basic_info_data_64_t info{};
++        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++        mach_port_t object = MACH_PORT_NULL;
++        kern_return_t result = mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
++                                              reinterpret_cast<vm_region_info_t>(&info), &count, &object);
++        if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
++        if (result == KERN_INVALID_ADDRESS) { gaps.push_back({cursor, limit}); break; }
++        if (result != KERN_SUCCESS) fatal("memory layout: region query failed (%d)", int(result));
++        if (address > cursor) gaps.push_back({cursor, std::min<uint64_t>(address, limit)});
++        if (address >= limit) break;
++        if (!size || address + size < address || address + size <= cursor)
++            fatal("memory layout: invalid region extent");
++        // Top-level submaps, including shared-cache reservations, are occupied in their entirety.
++        cursor = address + size;
++    }
++    std::array<uint64_t, 4> plan{};
++    bool found = false;
++    for (const auto& order : orders) {
++        std::function<bool(unsigned, uint64_t)> place = [&](unsigned step, uint64_t lower) {
++            if (step == 4) return true;
++            unsigned slot = order[step];
++            for (const auto& gap : gaps) {
++                uint64_t start = (std::max(lower, gap.begin) + page - 1) & ~(page - 1);
++                if (start >= gap.end || sizes[slot] > gap.end - start) continue;
++                plan[slot] = start;
++                if (place(step + 1, start + sizes[slot])) return true;
++            }
++            return false;
++        };
++        if (place(0, first)) { found = true; break; }
++    }
++    if (!found) {
++        uint64_t total_free = 0, max_gap = 0;
++        for (size_t i = 0; i < gaps.size(); ++i) {
++            const uint64_t length = gaps[i].end - gaps[i].begin;
++            total_free += length;
++            max_gap = std::max(max_gap, length);
++            log("memory layout: no-plan gap[%llu] start=%llx end=%llx size=%llx",
++                (unsigned long long)i, (unsigned long long)gaps[i].begin,
++                (unsigned long long)gaps[i].end, (unsigned long long)length);
++        }
++        log("memory layout: no-plan summary gaps=%llu total-free=%llx max-gap=%llx",
++            (unsigned long long)gaps.size(), (unsigned long long)total_free, (unsigned long long)max_gap);
++        fatal("memory layout: no plan for full 6/16/4/4 GiB regions below the 39-bit limit");
++    }
++    // The scan is only a snapshot. Exact, non-overwriting reservations decide ownership.
++    for (unsigned slot = 0; slot < 4; ++slot) {
++        if (!plat::reserve(plan[slot], sizes[slot])) {
++            for (unsigned owned = 0; owned < slot; ++owned)
++                mach_vm_deallocate(mach_task_self(), plan[owned], sizes[owned]);
++            fatal("memory layout: candidate changed before reservation at %llx (+%llx)",
++                  (unsigned long long)plan[slot], (unsigned long long)sizes[slot]);
++        }
++    }
++    kHeapBase = plan[0]; kAliasBase = plan[1]; kStackBase = plan[2]; kKernelBase = plan[3];
++    log("memory layout: modules=%llx heap=%llx alias=%llx stack=%llx kernel=%llx thunk=%llx",
++        (unsigned long long)kModuleBase, (unsigned long long)kHeapBase, (unsigned long long)kAliasBase,
++        (unsigned long long)kStackBase, (unsigned long long)kKernelBase, (unsigned long long)kThunkBase);
++}
++#endif
++
+ }  // namespace
+ 
+ void memory_init() {
+     reserve(kModuleBase, 0x20000000, "modules");
++#if defined(__APPLE__) && defined(NX_APPLE_MAC27_MEMORY)
++    reserve(kThunkBase, kThunkSize, "thunks");
++    reserve_dynamic_regions();
++#else
+     reserve(kHeapBase, kHeapMax, "heap");
+     reserve(kAliasBase, kAliasSize, "alias");
+     reserve(kStackBase, kStackSize, "stack");
+@@ -35,6 +129,8 @@
+     if (!plat::reserve(kThunkBase, kThunkSize))
+         log("memory: thunk range %llx (+%llx) already in use on this device: not reserved (only an address range for "
+             "HLE calls, never mapped)", (unsigned long long)kThunkBase, (unsigned long long)kThunkSize);
++#endif
++    g_kernel_next = kKernelBase;
+     // Only the alias and stack regions are free for the guest to pick addresses in (nn::os maps shared memory,
+     // transfer memory and thread stacks at random free addresses); everything else is reported inaccessible.
+     uint64_t end = kAddressSpaceBase + kAddressSpaceSize;
+--- a/runtime/src/hle_vi.cpp
++++ b/runtime/src/hle_vi.cpp
+@@ -35,12 +35,13 @@
+ // Opaque API handles, not SDK objects. Never map or dereference these tokens.
+ // One host window/layer is supported. Retired tokens are never reused.
+ std::mutex g_vi_mutex;
+-uint64_t g_vi_next = kKernelBase - 0x2000;
+ uint64_t g_vi_display = 0, g_vi_layer = 0;
+ uint64_t g_vi_references = 0;
+ constexpr uint32_t kViOperationFailed = 0x272;  // SDK SetLayerScalingMode native-window failure
+ 
+ uint64_t new_vi_token() {
++    // First use follows memory_init; do not cache a dynamic base during static initialization.
++    static uint64_t g_vi_next = kKernelBase - 0x2000;
+     if (g_vi_next < 0x10000) fatal("vi: opaque token space exhausted");
+     uint64_t token = g_vi_next;
+     g_vi_next -= 16;

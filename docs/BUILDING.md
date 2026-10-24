@@ -18,7 +18,7 @@ the game's code is lifted and compiled locally instead of being shipped.
 - [Homebrew](https://brew.sh) packages:
 
   ```sh
-  brew install cmake ninja pkg-config sdl3 opus molten-vk vulkan-headers spirv-tools zstd
+  brew install cmake ninja pkg-config sdl3 opus spirv-tools zstd
   ```
 
 - The **.NET 10 SDK**, for the offline shader translator: `brew install --cask dotnet-sdk`, or the macOS Arm64
@@ -29,8 +29,9 @@ the game's code is lifted and compiled locally instead of being shipped.
   translator (see THIRD_PARTY_NOTICES.md) source, installs three Python packages for the recompiler (`capstone`, `lz4`, `zstandard`),
   and restores the translator's NuGet packages. If you give no fonts, it also downloads Noto Sans.
 
-`cmake` and `ninja` are optional: without them the script installs both into its own Python environment. Without
-`vulkan-headers` it fetches the pinned Vulkan-Headers.
+`cmake` and `ninja` are optional: without them the script installs both into its own Python environment. The builder fetches a SHA-256 verified, pinned SPIRV-Cross source archive for its MSL compiler.
+
+The macOS renderer uses native Metal only, including shader pipelines, textures, command encoding and CAMetalLayer presentation. MetalFX Spatial is the default scaler; no Vulkan loader, headers or MoltenVK is needed. SPIR-V remains an offline shader intermediate and is compiled to MSL through the pinned SPIRV-Cross library. See [ASTRAL_NATIVE_METAL.md](ASTRAL_NATIVE_METAL.md) for current runtime acceptance limits.
 
 ## Build
 
@@ -83,7 +84,7 @@ and run **the same command again**: finished stages are skipped and the compile 
   (`nice 10`), and a watchdog checks memory pressure every few seconds: under warning or critical pressure, or
   with less than 4 GiB available, it stops the compile and resumes it with half the jobs, noting this in the
   output and in `logs/build.log`. Nothing finished is recompiled. `--jobs 4` is a safe explicit choice.
-- **Experimental:** `--render-res WxH` makes the game render docked at WxH instead of 1600x900, e.g. `2560x1440`,
+- **Internal resolution:** `--render-res WxH` defaults to 1920x1080 and makes the game render docked at WxH, e.g. `2560x1440`,
   by patching a dozen instructions of `main` (each original word checked first) before the lift. The game's
   graphics memory budget is scaled with the size automatically; `--graphics-memory-mib` overrides it. Tested
   headless at 1920x1080 and 2560x1440 through the opening only. Changing it relifts `main`; only the two changed
@@ -98,7 +99,7 @@ and run **the same command again**: finished stages are skipped and the compile 
   another version the default build prints a note and makes the 30 fps binary only.
   `--render-res` applies to both binaries.
 
-Other options: `--prefix` (SDL3/opus install prefix, default Homebrew), `--vulkan-include`, `--moltenvk`,
+Other options: `--prefix` (SDL3/opus install prefix, default Homebrew),
 `--dotnet`, `--cmake`, `--ninja`, `--reference` (a local SuperMarioWonderRecomp clone, for offline rebuilds),
 `--nvn-format-profile`, `--skip-shaders` and `--no-shader-validation`. Run `python3 tools/acr_build.py --help` for the full
 list.
