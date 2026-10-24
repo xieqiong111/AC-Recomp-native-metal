@@ -1,5 +1,20 @@
 # AC-Recomp
 
+## 项目简介（中文）
+
+**AC-Recomp** 是《异界锁链》(Astral Chain) 1.0.0 在 Apple Silicon macOS 上的实验性静态重编译移植。本分支的 Astral 目标全程使用**原生 Metal 图形后端**（无 Vulkan/MoltenVK），支持 MetalFX Spatial 超分（原生 1920×1080 输入 → 屏幕分辨率）。
+
+本仓库包含的原创工作（详见 `docs/ASTRAL_NATIVE_METAL.md`）：
+
+- NVN→Metal 命令重放后端：零拷贝池别名、bind 时 uniform 快照、counter 快速路径（无流内等待）
+- 性能优化系列（同场景 A/B 实测：救援场景 38.6 → 45.85 FPS，+18.9%）：流水线化部分提交、GPU 写区间跟踪的精确 CPU 读取、present 流水线 + 60Hz deadline
+- 诊断工具链（环境变量开关）：逐 encoder GPU 计数器采样、按管线绘制直方图、消融剖析器
+- Apple 平台内存布局修复（动态/弹性内存补丁）
+
+不包含任何游戏内容：需自备合法导出的本体与主机密钥；更新档（含 1.0.1）不使用；导入内容、生成代码、shader 与构建产物保留在 `.local/` 下不上传。
+
+---
+
 > [!IMPORTANT]
 > **This project was built with heavy AI assistance.** Most of the code, tooling, reverse engineering and
 > documentation in this repository was written by an AI model (Anthropic's Claude, through Claude Code), directed,
